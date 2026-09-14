@@ -15,15 +15,18 @@
 
 import inspect
 import socket
-from unittest.mock import AsyncMock, MagicMock, patch
+import urllib.error
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from nemo_gym.orchestration import ray_serve_gateway
 from nemo_gym.orchestration.ray_serve_gateway import (
+    HEALTH_PATH,
     VLLMInstance,
     build_instance_command,
     free_local_port,
+    main,
     max_replicas_per_node,
     parse_args,
 )
@@ -268,6 +271,76 @@ def _running_proc() -> MagicMock:
     return proc
 
 
+def test_vllm_instance_launches_vllm_serve_on_its_own_port_inside_the_ray_cluster():
+    instance, popen, urlopen = _instance(
+        _running_proc(),
+        urlopen_side_effect=[_health_response()],
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        trust_remote_code=True,
+        served_model_name="my-model",
+        extra_args="--max-model-len 8192",
+    )
+
+    cmd = popen.call_args.args[0]
+    port = int(cmd[cmd.index("--port") + 1])
+    assert cmd == build_instance_command("org/model", 2, 2, True, port, "my-model", "--max-model-len 8192")
+    # vLLM's own Ray executor must join the gateway's cluster rather than start a new one.
+    assert popen.call_args.kwargs["env"]["RAY_ADDRESS"] == "10.0.0.1:6379"
+    assert instance._base_url == f"http://localhost:{port}"
+    assert urlopen.call_args.args[0] == f"http://localhost:{port}{HEALTH_PATH}"
+
+
+def test_vllm_instance_keeps_polling_until_the_health_endpoint_answers_200():
+    _, _, urlopen = _instance(
+        _running_proc(),
+        urlopen_side_effect=[
+            urllib.error.URLError("connection refused"),
+            TimeoutError(),
+            _health_response(status=503),
+            _health_response(status=200),
+        ],
+    )
+
+    assert urlopen.call_count == 4
+
+
+def test_vllm_instance_raises_when_vllm_exits_before_becoming_healthy():
+    proc = MagicMock()
+    proc.poll.return_value = 3
+    proc.returncode = 3
+
+    with pytest.raises(RuntimeError, match="exited early with code 3"):
+        _instance(proc, urlopen_side_effect=[_health_response()])
+
+
+def test_vllm_instance_raises_when_the_health_deadline_passes():
+    # First call sets the deadline; the second is already past it.
+    with patch.object(ray_serve_gateway.time, "monotonic", side_effect=[0.0, ray_serve_gateway.HEALTH_TIMEOUT_S + 1]):
+        with pytest.raises(TimeoutError, match="did not become healthy in time"):
+            _instance(_running_proc(), urlopen_side_effect=urllib.error.URLError("connection refused"))
+
+
+def test_vllm_instance_check_health_passes_while_vllm_runs_and_fails_once_it_exits():
+    proc = _running_proc()
+    instance, _, _ = _instance(proc, urlopen_side_effect=[_health_response()])
+
+    instance.check_health()
+
+    proc.poll.return_value = 1
+    proc.returncode = 1
+    with pytest.raises(RuntimeError, match="exited with code 1"):
+        instance.check_health()
+
+
+async def test_vllm_instance_health_endpoint_returns_200():
+    instance, _, _ = _instance(_running_proc(), urlopen_side_effect=[_health_response()])
+
+    response = await instance.health()
+
+    assert response.status_code == 200
+
+
 def _proxy_instance(upstream_status: int, upstream_headers: dict[str, str], upstream_body: bytes):
     """A healthy replica whose aiohttp session returns a canned vLLM response."""
     instance, _, _ = _instance(_running_proc(), urlopen_side_effect=[_health_response()])
@@ -290,6 +363,31 @@ def _gateway_request(method: str, headers: dict[str, str], query_params: dict[st
     request.query_params = query_params
     request.body = AsyncMock(return_value=body)
     return request
+
+
+async def test_vllm_instance_proxy_forwards_the_request_and_relays_the_vllm_response():
+    instance = _proxy_instance(201, {"Content-Type": "application/json", "Content-Length": "2"}, b"{}")
+    request = _gateway_request(
+        "POST",
+        {"Host": "gateway:8000", "Content-Length": "7", "Authorization": "Bearer token"},
+        {"stream": "false"},
+        b'{"a":1}',
+    )
+
+    response = await instance.proxy(request, "v1/chat/completions")
+
+    # `Host` and `Content-Length` are dropped: vLLM must see its own host, and aiohttp sizes the body itself.
+    assert instance._session.request.call_args == call(
+        "POST",
+        f"{instance._base_url}/v1/chat/completions",
+        params={"stream": "false"},
+        data=b'{"a":1}',
+        headers={"Authorization": "Bearer token"},
+    )
+    assert response.status_code == 201
+    assert response.body == b"{}"
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["content-length"] == "2"
 
 
 async def test_vllm_instance_proxy_does_not_relay_hop_by_hop_headers_from_a_chunked_vllm_response():
@@ -321,3 +419,88 @@ async def test_vllm_instance_proxy_does_not_relay_hop_by_hop_headers_from_a_chun
     assert response.headers["content-length"] == str(len(body))
     for header in ("transfer-encoding", "connection", "date", "server"):
         assert header not in response.headers
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+class _StopGateway(Exception):
+    """Raised from the patched `time.sleep` to leave `main`'s keep-alive loop."""
+
+
+def _run_main(argv: list[str], *, ray_init_side_effect=None, environ: dict[str, str] | None = None):
+    deployment = MagicMock()
+    with (
+        patch.object(ray_serve_gateway.ray, "init", side_effect=ray_init_side_effect) as ray_init,
+        patch.object(ray_serve_gateway, "VLLMInstance", deployment),
+        patch.object(ray_serve_gateway.serve, "start") as serve_start,
+        patch.object(ray_serve_gateway.serve, "run") as serve_run,
+        patch.object(ray_serve_gateway.time, "sleep", side_effect=_StopGateway),
+        patch.dict(ray_serve_gateway.os.environ, environ or {}, clear=True),
+    ):
+        with pytest.raises(_StopGateway):
+            main(argv)
+        environ = dict(ray_serve_gateway.os.environ)
+    return ray_init, deployment, serve_start, serve_run, environ
+
+
+def test_main_joins_the_existing_ray_cluster_and_serves_the_deployment():
+    ray_init, deployment, serve_start, serve_run, environ = _run_main(
+        [
+            "--model",
+            "org/model",
+            "--port",
+            "8000",
+            "--tensor-parallel-size",
+            "8",
+            "--pipeline-parallel-size",
+            "2",
+            "--number-of-instances",
+            "2",
+            "--gpus-per-node",
+            "8",
+            "--trust-remote-code",
+            "--served-model-name",
+            "my-model",
+            "--extra-args",
+            "--max-model-len 8192",
+        ]
+    )
+
+    assert ray_init.call_args_list == [call(address="auto")]
+    # TP8 x PP2 spans two 8-GPU nodes, so no node may host a second instance's driver.
+    assert deployment.options.call_args == call(num_replicas=2, max_replicas_per_node=1)
+    assert deployment.options.return_value.bind.call_args == call(
+        model="org/model",
+        tensor_parallel_size=8,
+        pipeline_parallel_size=2,
+        trust_remote_code=True,
+        served_model_name="my-model",
+        extra_args="--max-model-len 8192",
+    )
+    assert serve_start.call_args == call(http_options={"host": "0.0.0.0", "port": 8000})
+    assert serve_run.call_args == call(deployment.options.return_value.bind.return_value)
+    assert environ["RAY_SERVE_QUEUE_LENGTH_RESPONSE_DEADLINE_S"] == "1.0"
+
+
+def test_main_starts_a_local_ray_cluster_when_there_is_none_to_join():
+    ray_init, deployment, _, _, _ = _run_main(
+        ["--model", "org/model", "--port", "8000"],
+        ray_init_side_effect=[ConnectionError("no cluster"), None],
+    )
+
+    assert ray_init.call_args_list == [call(address="auto"), call()]
+    # Without --gpus-per-node, Serve packs replicas freely.
+    assert deployment.options.call_args == call(num_replicas=1, max_replicas_per_node=None)
+
+
+def test_main_keeps_an_existing_queue_length_deadline():
+    # The multi-node sbatch path exports this before `ray start`; main must not override it.
+    _, _, _, _, environ = _run_main(
+        ["--model", "org/model", "--port", "8000"],
+        environ={"RAY_SERVE_QUEUE_LENGTH_RESPONSE_DEADLINE_S": "5.0"},
+    )
+
+    assert environ["RAY_SERVE_QUEUE_LENGTH_RESPONSE_DEADLINE_S"] == "5.0"

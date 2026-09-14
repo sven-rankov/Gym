@@ -46,6 +46,23 @@ logger = logging.getLogger(__name__)
 HEALTH_PATH = "/health"
 HEALTH_POLL_INTERVAL_S = 5.0
 HEALTH_TIMEOUT_S = 900.0
+# Headers that describe the proxied hop rather than the payload: the connection-level set from
+# RFC 9110 section 7.6.1, the framing headers, and the upstream server's identity. The gateway's own
+# HTTP server regenerates them for the response it sends.
+_HOP_BY_HOP_RESPONSE_HEADERS = frozenset(
+    {
+        "connection",
+        "content-length",
+        "date",
+        "keep-alive",
+        "proxy-connection",
+        "server",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -182,7 +199,10 @@ class VLLMInstance:
             headers=forward_headers,
         ) as resp:
             content = await resp.read()
-            response_headers = {k: v for k, v in resp.headers.items() if k.lower() != "content-length"}
+            # The body is re-sent whole, so vLLM's framing must not leak through: relaying
+            # `Transfer-Encoding: chunked` next to the recomputed Content-Length produces a response
+            # that aiohttp clients reject.
+            response_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _HOP_BY_HOP_RESPONSE_HEADERS}
             return Response(content=content, status_code=resp.status, headers=response_headers)
 
 
